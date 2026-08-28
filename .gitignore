@@ -1,6 +1,11 @@
 # 凭据与登录态 — 严禁入库
-creds.json
+creds*.json
 .camp_profile/
+
+# 运行日志（可能含敏感输出）
+*.log
+nohup.out
+.env
 
 # 爬取数据产物（可运行 --scrape-only / --extra-data 重新生成）
 data/

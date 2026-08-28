@@ -62,9 +62,36 @@ RETRY = 3
 # 登录态失效错误码 → 提示重新登录
 AUTH_ERROR_CODES = (-30003, -30314, -59005)
 
-CTX = ssl.create_default_context()
-CTX.check_hostname = False
-CTX.verify_mode = ssl.CERT_NONE
+# 恢复 TLS 证书校验: 优先用 certifi 提供 CA 链(解决 Python 3.14 缺系统证书问题)
+try:
+    import certifi
+    CTX = ssl.create_default_context(cafile=certifi.where())
+except Exception:
+    CTX = ssl.create_default_context()
+
+
+def atomic_json_dump(obj, path):
+    """原子写 JSON: 先写 .tmp 再 os.replace, 避免中断损坏数据文件。"""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def load_json_checked(path, default=None):
+    """读取 JSON, 损坏/缺失时告警并返回 default(空 dict)。"""
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        print(f"⚠ 警告: {path} 无法读取(可能损坏), 按空数据继续")
+        return default if default is not None else {}
+
+
+def is_auth_error(d):
+    """判断响应是否为登录态失效 (错误码 str 化比较 + 中文子串兜底)。"""
+    code = str(d.get("returnCode"))
+    return code in {str(c) for c in AUTH_ERROR_CODES} or "登录态失效" in str(d.get("returnMsg", ""))
 
 
 # ---------------------------------------------------------------------------
@@ -84,60 +111,73 @@ def login(creds_path=CREDS_PATH, timeout_s=LOGIN_TIMEOUT_S):
     print("=" * 60, flush=True)
 
     with sync_playwright() as p:
-        context = p.chromium.launch_persistent_context(
-            PROFILE_DIR, headless=False, viewport={"width": 1280, "height": 900},
-        )
-        page = context.pages[0] if context.pages else context.new_page()
-        page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
-
-        # 尝试自动点击「未登录」(可能被遮罩挡, 失败则让用户手动点)
+        context = None
         try:
-            page.get_by_text("未登录", exact=True).first.click(timeout=3000, force=True)
-            print("  已自动点击「未登录」")
-        except Exception:
-            print("  请在页面中手动点击「未登录」按钮...")
-
-        # 轮询 localStorage 直到出现 ssoOpenId
-        deadline = time.time() + timeout_s
-        login_info = None
-        while time.time() < deadline:
+            context = p.chromium.launch_persistent_context(
+                PROFILE_DIR, headless=False, viewport={"width": 1280, "height": 900},
+            )
+            page = context.pages[0] if context.pages else context.new_page()
             try:
-                raw = page.evaluate("() => localStorage.getItem('loginInfo')")
-                if raw:
-                    info = json.loads(raw)
-                    if info.get("session", {}).get("ssoOpenId"):
-                        login_info = info
-                        break
+                page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
+            except Exception as e:
+                sys.exit(f"✗ 打开登录页失败: {e}")
+
+            # 尝试自动点击「未登录」(可能被遮罩挡, 失败则让用户手动点)
+            try:
+                page.get_by_text("未登录", exact=True).first.click(timeout=3000, force=True)
+                print("  已自动点击「未登录」")
             except Exception:
-                pass
-            time.sleep(2)
+                print("  请在页面中手动点击「未登录」按钮...")
 
-        if not login_info:
-            sys.exit("✗ 等待扫码超时(300s), 请重跑脚本重新扫码。")
+            # 轮询 localStorage 直到出现 ssoOpenId + ssoToken
+            deadline = time.time() + timeout_s
+            login_info = None
+            while time.time() < deadline:
+                try:
+                    raw = page.evaluate("() => localStorage.getItem('loginInfo')")
+                    if raw:
+                        info = json.loads(raw)
+                        sess = info.get("session", {})
+                        if sess.get("ssoOpenId") and sess.get("ssoToken"):
+                            login_info = info
+                            break
+                except Exception:
+                    pass
+                time.sleep(2)
 
-        user_info_raw = page.evaluate("() => localStorage.getItem('userInfo')")
-        user_info = json.loads(user_info_raw or "{}")
-        session = login_info["session"]
+            if not login_info:
+                sys.exit("✗ 等待扫码超时(300s), 请重跑脚本重新扫码。")
 
-        creds = {
-            "ssoOpenId": session["ssoOpenId"],
-            "ssoAppId": session.get("ssoAppId", "campPc"),
-            "ssoToken": session["ssoToken"],
-            "ssoBusinessId": session.get("ssoBusinessId", "pc"),
-            "userId": (user_info.get("profile") or {}).get("userId", ""),
-            "expireTime": login_info.get("expireTime"),
-            "savedAt": int(time.time()),
-        }
-        save_creds(creds, creds_path)
-        print(f"✓ 登录成功: {creds['ssoAppId']} / userId={creds['userId']} / 过期={creds['expireTime']}")
-        context.close()
+            try:
+                user_info_raw = page.evaluate("() => localStorage.getItem('userInfo')")
+                user_info = json.loads(user_info_raw or "{}")
+            except (ValueError, TypeError):
+                user_info = {}
+            session = login_info["session"]
+
+            creds = {
+                "ssoOpenId": session["ssoOpenId"],
+                "ssoAppId": session.get("ssoAppId", "campPc"),
+                "ssoToken": session["ssoToken"],
+                "ssoBusinessId": session.get("ssoBusinessId", "pc"),
+                "userId": (user_info.get("profile") or {}).get("userId", ""),
+                "expireTime": login_info.get("expireTime"),
+                "savedAt": int(time.time()),
+            }
+            save_creds(creds, creds_path)
+            uid = creds["userId"]
+            print(f"✓ 登录成功: {creds['ssoAppId']} / userId={uid[:3]}*** / 过期={creds['expireTime']}")
+        finally:
+            if context:
+                context.close()
     return creds
 
 
 def save_creds(creds, creds_path=CREDS_PATH):
-    with open(creds_path, "w") as f:
+    # 原子创建并设 0600 权限, 避免默认 umask 造成创建窗口期
+    fd = os.open(creds_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         json.dump(creds, f, ensure_ascii=False, indent=2)
-    os.chmod(creds_path, 0o600)
 
 
 def load_creds(creds_path=CREDS_PATH):
@@ -176,10 +216,9 @@ def fetch_hero(creds, hero_id):
         "userId": creds.get("userId", ""),
     }
     d = api_call("/hero/getheropageinfo", params)
-    code = d.get("returnCode")
-    if code in AUTH_ERROR_CODES or "登录态失效" in str(d.get("returnMsg", "")):
+    if is_auth_error(d):
         return {"heroId": hero_id, "error": "登录态失效, 请重新登录"}
-    if d.get("result") != 0 or code != 0:
+    if d.get("result") != 0 or d.get("returnCode") != 0:
         return {"heroId": hero_id, "error": str(d.get("returnMsg") or d.get("returnCode"))}
     data = d.get("data", {})
     return {
@@ -207,9 +246,7 @@ def get_herolist():
 def scrape_all(creds, out_dir=DATA_DIR):
     os.makedirs(out_dir, exist_ok=True)
     herolist = get_herolist()
-    result = {}
-    if os.path.exists(JSON_PATH):
-        result = json.load(open(JSON_PATH))
+    result = load_json_checked(JSON_PATH)
 
     todo = [h for h in herolist if h[0] not in result or "error" in result[h[0]] or not result[h[0]].get("attrInfo")]
     print(f"STEP 2/3  英雄总数 {len(herolist)}, 已完成 {len(herolist)-len(todo)}, 待抓 {len(todo)}")
@@ -218,30 +255,35 @@ def scrape_all(creds, out_dir=DATA_DIR):
         rec = fetch_hero(creds, hid)
         rec["name"] = name
         if rec.get("error") == "登录态失效, 请重新登录":
-            json.dump(result, open(JSON_PATH, "w"), ensure_ascii=False)
+            atomic_json_dump(result, JSON_PATH)
             sys.exit("✗ SSO 凭据已过期! 重跑完整流程重新扫码: python3 wzry_camp_scraper.py")
         result[hid] = rec
         ok = "OK" if rec.get("attrInfo") else f"ERR {rec.get('error','')[:40]}"
         print(f"  [{i+1}/{len(todo)}] {hid} {name}: {ok}", flush=True)
         if (i + 1) % 10 == 0:
-            json.dump(result, open(JSON_PATH, "w"), ensure_ascii=False)
+            atomic_json_dump(result, JSON_PATH)
             print(f"    -- checkpoint: {len(result)} 英雄", flush=True)
         time.sleep(REQUEST_DELAY)
 
-    json.dump(result, open(JSON_PATH, "w"), ensure_ascii=False)
+    atomic_json_dump(result, JSON_PATH)
     write_csv(result, CSV_PATH)
     n_ok = sum(1 for v in result.values() if v.get("attrInfo"))
-    print(f"STEP 3/3  ✓ 完成: {len(result)} 英雄, {n_ok} 含属性")
+    n_err = sum(1 for v in result.values() if "error" in v)
+    print(f"STEP 3/3  ✓ 完成: {len(result)} 英雄, {n_ok} 含属性, {n_err} 失败")
     print(f"  JSON: {JSON_PATH}")
     print(f"  CSV : {CSV_PATH}")
+    if n_err:
+        sys.exit(f"✗ {n_err} 个英雄抓取失败, 退出码 1 (重跑可续抓)")
     return result
 
 
 def write_csv(result, path):
+    import csv
     cols = ["heroId", "name", "最大生命", "最大法力", "物理攻击", "法术攻击", "物理防御", "法术防御",
             "移速", "攻速加成", "暴击几率", "暴击效果", "攻击范围", "每五秒回血", "每五秒回蓝", "updateTime"]
-    with open(path, "w") as f:
-        f.write(",".join(cols) + "\n")
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(cols)
         for hid, h in sorted(result.items(), key=lambda x: int(x[0])):
             attr = h.get("attrInfo") or {}
 
@@ -258,7 +300,7 @@ def write_csv(result, path):
                    gv("attack", "暴击几率"), gv("attack", "暴击效果"),
                    gv("attack", "攻击范围"), gv("defence", "每五秒回血"), gv("defence", "每五秒回蓝"),
                    h.get("updateTime", "")]
-            f.write(",".join("" if v is None else str(v) for v in row) + "\n")
+            w.writerow(["" if v is None else v for v in row])
 
 
 def show_hero(creds, hero_id):
@@ -292,9 +334,13 @@ def strip_html(text):
 
 
 def fetch_official_json(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=20, context=CTX) as r:
-        return json.loads(r.read().decode("utf-8", "ignore"))
+    """官网静态 JSON; 失败时友好退出(与 get_herolist 行为一致)。"""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=20, context=CTX) as r:
+            return json.loads(r.read().decode("utf-8", "ignore"))
+    except Exception as e:
+        sys.exit(f"✗ 官网数据下载失败 {url}: {e}")
 
 
 def fetch_skills(creds, hero_id):
@@ -307,12 +353,11 @@ def fetch_skills(creds, hero_id):
         "heroId": str(hero_id),
     }
     d = api_call("/hero/getheroskillinfo", params)
-    code = d.get("returnCode")
-    if code in AUTH_ERROR_CODES or "登录态失效" in str(d.get("returnMsg", "")):
+    if is_auth_error(d):
         return None, "登录态失效, 请重新登录"
-    if d.get("result") != 0 or code != 0:
+    if d.get("result") != 0 or d.get("returnCode") != 0:
         return None, str(d.get("returnMsg") or d.get("returnCode"))
-    return d.get("data", []), None
+    return d.get("data") or [], None
 
 
 def scrape_extra(creds, out_dir=DATA_DIR):
@@ -323,56 +368,63 @@ def scrape_extra(creds, out_dir=DATA_DIR):
     for key, meta in EXTRA_FILES.items():
         data = fetch_official_json(meta["url"])
         jp, cp = os.path.join(out_dir, key + ".json"), os.path.join(out_dir, key + ".csv")
-        json.dump(data, open(jp, "w"), ensure_ascii=False, indent=1)
+        atomic_json_dump(data, jp)
         # CSV: 自动按字段输出, 描述列去 HTML
         if data:
             cols = list(data[0].keys())
-            with open(cp, "w") as f:
-                f.write(",".join(cols) + "\n")
+            with open(cp, "w", newline="") as f:
+                import csv as _csv
+                w = _csv.writer(f)
+                w.writerow(cols)
                 for row in data:
-                    f.write(",".join(
-                        '"' + strip_html(str(row.get(c, ""))).replace('"', '""') + '"' for c in cols) + "\n")
+                    w.writerow([strip_html(str(row.get(c, ""))) for c in cols])
         print(f"✓ {meta['name']}: {len(data)} 条 -> {os.path.basename(jp)} / {os.path.basename(cp)}")
 
     # 2) 全英雄技能 (营地 API)
     herolist = get_herolist()
-    skills = {}
-    if os.path.exists(os.path.join(out_dir, "hero_skills.json")):
-        skills = json.load(open(os.path.join(out_dir, "hero_skills.json")))
+    skills_path = os.path.join(out_dir, "hero_skills.json")
+    skills = load_json_checked(skills_path)
     todo = [h for h in herolist if h[0] not in skills]
     print(f"英雄技能: 总 {len(herolist)}, 已完成 {len(herolist)-len(todo)}, 待抓 {len(todo)}")
     for i, (hid, name) in enumerate(todo):
         data, err = fetch_skills(creds, hid)
         if err:
             if "登录态失效" in err:
-                json.dump(skills, open(os.path.join(out_dir, "hero_skills.json"), "w"), ensure_ascii=False)
+                atomic_json_dump(skills, skills_path)
                 sys.exit("✗ SSO 凭据已过期! 重跑完整流程重新扫码: python3 wzry_camp_scraper.py")
             skills[hid] = {"heroId": hid, "name": name, "error": err}
         else:
-            skills[hid] = {"heroId": hid, "name": name, "skillArray": (data[0] or {}).get("skillArray", [])}
+            skill_array = ((data or [{}])[0] or {}).get("skillArray", []) if data else []
+            skills[hid] = {"heroId": hid, "name": name, "skillArray": skill_array}
         print(f"  [{i+1}/{len(todo)}] {hid} {name}: {'OK' if not err else err[:40]}", flush=True)
         if (i + 1) % 10 == 0:
-            json.dump(skills, open(os.path.join(out_dir, "hero_skills.json"), "w"), ensure_ascii=False)
+            atomic_json_dump(skills, skills_path)
         time.sleep(REQUEST_DELAY)
-    json.dump(skills, open(os.path.join(out_dir, "hero_skills.json"), "w"), ensure_ascii=False)
+    atomic_json_dump(skills, skills_path)
 
     # 技能 CSV (展开为每英雄每技能一行, 含结构化数值成长)
     sp = os.path.join(out_dir, "hero_skills.csv")
-    with open(sp, "w") as f:
-        f.write("heroId,heroName,skillId,skillTitle,skillType,skillLabel,coolDown,loss,skillData1,skillData2,skillData3,skillData4,skillData5,gameLabels,skillDesc\n")
+    import csv as _csv
+    with open(sp, "w", newline="") as f:
+        w = _csv.writer(f)
+        w.writerow(["heroId", "heroName", "skillId", "skillTitle", "skillType", "skillLabel",
+                    "coolDown", "loss", "skillData1", "skillData2", "skillData3", "skillData4",
+                    "skillData5", "gameLabels", "skillDesc"])
         for hid, h in sorted(skills.items(), key=lambda x: int(x[0])):
             for s in h.get("skillArray", []):
                 desc = strip_html(s.get("szDesc", ""))
                 labels = ",".join(g.get("Text", "") for g in s.get("gameLabels", []) or [])
-                row = [
+                w.writerow([
                     hid, h.get("name", ""), s.get("iSkillId", ""), s.get("szTitle", ""),
                     s.get("szType", ""), s.get("szLabel", ""), s.get("iCoolDown", ""), s.get("iLoss", ""),
                     s.get("szSkillData1", "") or "", s.get("szSkillData2", "") or "",
                     s.get("szSkillData3", "") or "", s.get("szSkillData4", "") or "",
                     s.get("szSkillData5", "") or "", labels, desc,
-                ]
-                f.write(",".join('"' + str(v).replace('"', '""') + '"' for v in row) + "\n")
-    print(f"✓ 英雄技能: {len(skills)} 英雄 -> hero_skills.json / hero_skills.csv")
+                ])
+    n_err = sum(1 for v in skills.values() if "error" in v)
+    print(f"✓ 英雄技能: {len(skills)} 英雄, {n_err} 失败 -> hero_skills.json / hero_skills.csv")
+    if n_err:
+        sys.exit(f"✗ {n_err} 个英雄技能抓取失败, 退出码 1 (重跑可续抓)")
     return skills
 
 
@@ -387,6 +439,10 @@ def main():
     ap.add_argument("--extra-data", action="store_true",
                     help="抓额外数据: 装备/铭文/召唤师技能(官网) + 全英雄技能(营地API)")
     args = ap.parse_args()
+
+    # 互斥: --hero 是独立调试模式, 不与其余模式混用
+    if args.hero and (args.scrape_only or args.login_only or args.extra_data):
+        ap.error("--hero 是独立调试模式, 不能与 --scrape-only/--login-only/--extra-data 混用")
 
     if args.hero:
         creds = load_creds()
