@@ -174,17 +174,22 @@ def login(creds_path=CREDS_PATH, timeout_s=LOGIN_TIMEOUT_S):
 
 
 def save_creds(creds, creds_path=CREDS_PATH):
-    # 原子创建并设 0600 权限, 避免默认 umask 造成创建窗口期
-    fd = os.open(creds_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # 原子创建并设 0600 权限: 先写 .tmp(os.open 指定 mode) 再 os.replace
+    tmp = creds_path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump(creds, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, creds_path)
 
 
 def load_creds(creds_path=CREDS_PATH):
     if not os.path.exists(creds_path):
         sys.exit("✗ 未找到 creds.json, 请先运行完整流程登录: python3 wzry_camp_scraper.py")
-    with open(creds_path) as f:
-        return json.load(f)
+    try:
+        with open(creds_path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        sys.exit(f"✗ creds.json 损坏或无法读取 ({e}), 请重新登录: python3 wzry_camp_scraper.py")
 
 
 # ---------------------------------------------------------------------------
