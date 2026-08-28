@@ -2,6 +2,8 @@
 
 一条命令完成：**网页扫码登录 → 提取 SSO 凭据 → 批量抓取全英雄基础属性 → 输出 JSON/CSV**。
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 数据源为王者营地官方 API（`ssl.kohsocialapp.qq.com:10001/hero/getheropageinfo`），
 `updateTime` 为当天/前一天，即**当前正式服数值**（含新英雄）。
 
