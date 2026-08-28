@@ -1,0 +1,11 @@
+# 凭据与登录态 — 严禁入库
+creds.json
+.camp_profile/
+
+# 爬取数据产物（可运行 --scrape-only / --extra-data 重新生成）
+data/
+
+# 通用
+__pycache__/
+*.pyc
+.DS_Store
