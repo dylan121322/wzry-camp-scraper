@@ -425,7 +425,7 @@ def scrape_equips(out_dir=DATA_DIR):
             "icon": d.get("icon", ""),
         })
     jp, cp = os.path.join(out_dir, "equips_full.json"), os.path.join(out_dir, "equips_full.csv")
-    json.dump(rows, open(jp, "w"), ensure_ascii=False, indent=1)
+    atomic_json_dump(rows, jp)
     with open(cp, "w", newline="") as f:
         import csv as _csv
         w = _csv.writer(f)
