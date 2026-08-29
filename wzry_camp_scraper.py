@@ -365,6 +365,80 @@ def fetch_skills(creds, hero_id):
     return d.get("data") or [], None
 
 
+# ---------------------------------------------------------------------------
+# 装备全量详情 (官网"装备宝典" COS 数据, 公开无需登录)
+# ---------------------------------------------------------------------------
+COS_EQUIP_LIST = "https://wuji-1254960240.file.myqcloud.com/smoba_weapon/pages/p{}.json"
+COS_EQUIP_DETAIL = "https://wuji-1254960240.file.myqcloud.com/smoba_weapon_detail/{}.json"
+
+
+def cos_get(url, retries=3):
+    """COS 公开 JSON; 带重试, 失败返回 None。"""
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    for i in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=15, context=CTX) as r:
+                return json.loads(r.read().decode("utf-8", "ignore"))
+        except Exception:
+            time.sleep(1 + i)
+    return None
+
+
+def scrape_equips(out_dir=DATA_DIR):
+    """全量装备详情: 列表(p1~p6) + 逐件详情(属性/被动/合成/适合英雄/攻略)。"""
+    equips = {}
+    for p in range(1, 7):
+        d = cos_get(COS_EQUIP_LIST.format(p))
+        if d:
+            for e in d:
+                equips[str(e["equipment_id"])] = e
+    print(f"装备列表: {len(equips)} 件")
+
+    details, fails = {}, []
+    for i, eid in enumerate(equips):
+        d = cos_get(COS_EQUIP_DETAIL.format(eid))
+        if d and d.get("equipment_id") is not None:
+            details[eid] = d
+        else:
+            fails.append(eid)
+        if (i + 1) % 30 == 0:
+            print(f"  [{i+1}/{len(equips)}] 详情 {len(details)}", flush=True)
+        time.sleep(0.15)
+
+    rows = []
+    for eid, d in sorted(details.items(), key=lambda x: int(x[0])):
+        attrs = d.get("attributes") or {}
+        compound = d.get("compound_url") or {}
+        sub_ids = [str(c.get("equipment_id")) for c in compound.get("compound") or []]
+        fit = d.get("fit_heroes") or {}
+        rows.append({
+            "equipment_id": eid,
+            "name": d.get("name", ""),
+            "type": d.get("type", ""),
+            "sub_type": d.get("sub_type", ""),
+            "price": d.get("price", ""),
+            "attributes": strip_html(attrs.get("attributes", "")),
+            "passive_skill": strip_html(attrs.get("sub", "")),
+            "compound_ids": "|".join(sub_ids),
+            "fit_heroes": "、".join(h.get("desc", "") for h in fit.get("fit_heroes") or []),
+            "tips": strip_html(d.get("tips", "")),
+            "icon": d.get("icon", ""),
+        })
+    jp, cp = os.path.join(out_dir, "equips_full.json"), os.path.join(out_dir, "equips_full.csv")
+    json.dump(rows, open(jp, "w"), ensure_ascii=False, indent=1)
+    with open(cp, "w", newline="") as f:
+        import csv as _csv
+        w = _csv.writer(f)
+        w.writerow(list(rows[0].keys()))
+        for r in rows:
+            w.writerow([r[k] for k in rows[0].keys()])
+    n_passive = sum(1 for r in rows if r["passive_skill"])
+    print(f"✓ 全量装备: {len(rows)} 件, {n_passive} 含被动/主动 | 失败 {len(fails)} | {os.path.basename(jp)} / {os.path.basename(cp)}")
+    if fails:
+        print(f"  失败ID: {fails}")
+    return rows
+
+
 def scrape_extra(creds, out_dir=DATA_DIR):
     """抓取装备/铭文/召唤师技能(官网JSON) + 全英雄技能(营地API)。"""
     os.makedirs(out_dir, exist_ok=True)
@@ -464,6 +538,7 @@ def main():
 
     if args.extra_data:
         scrape_extra(creds)
+        scrape_equips()
     else:
         scrape_all(creds)
 

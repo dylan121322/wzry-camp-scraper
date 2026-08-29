@@ -36,6 +36,7 @@ python3 wzry_camp_scraper.py --extra-data   # 抓额外数据: 装备/铭文/召
 | `data/mings.json` / `.csv` | 全量铭文表（93 个：类型红绿蓝/等级/属性） |
 | `data/summoners.json` / `.csv` | 召唤师技能（11 个：CD/效果） |
 | `data/hero_skills.json` / `.csv` | 全英雄技能（132 英雄 538 技能：被动/主动/大招，描述含当前数值+成长系数） |
+| `data/equips_full.json` / `.csv` | 全量装备宝典（126 件：属性/被动主动/合成配方/适合英雄/攻略，来源官网 COS 公开数据） |
 | `creds.json` | SSO 凭据（权限 0600，**勿泄露/勿提交 git**） |
 | `.camp_profile/` | Playwright 持久会话，登录态复用（下次扫码免登录） |
 
