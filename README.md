@@ -24,6 +24,10 @@ python3 wzry_camp_scraper.py --scrape-only
 python3 wzry_camp_scraper.py --login-only   # 只登录保存凭据
 python3 wzry_camp_scraper.py --hero 105     # 抓单个英雄（调试）
 python3 wzry_camp_scraper.py --extra-data   # 抓额外数据: 装备/铭文/召唤师技能 + 全英雄技能
+
+# 仅抓装备宝典（独立脚本, 公开COS数据源, 无需登录/凭据）
+python3 wzry_equip.py
+python3 wzry_equip.py --out /path/to/dir    # 自定义输出目录
 ```
 
 ## 输出
